@@ -136,9 +136,10 @@ fn an_unavailable_daemon_falls_back_to_local_heuristics() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// A daemon that accepts and then stalls must not hold the terminal.
+/// A daemon that accepts and then stalls must not hold the terminal, and
+/// must not send the caller off to spend the deadline again on the network.
 #[test]
-fn a_silent_daemon_does_not_hold_the_terminal() {
+fn a_silent_daemon_is_answered_locally_within_the_deadline() {
     let _guard = env_guard();
     let path = socket("silent");
     let listener = UnixListener::bind(&path).expect("bind");
@@ -153,7 +154,9 @@ fn a_silent_daemon_does_not_hold_the_terminal() {
     let elapsed = started.elapsed();
     std::env::remove_var("YOLO_SOCKET");
 
-    assert!(outcome.is_none(), "a stalled read should read as no daemon");
+    let outcome = outcome.expect("a connected daemon must answer, not fall through");
+    assert_eq!(outcome.source, Source::Local);
+    assert_eq!(outcome.decision.action, Action::BlockCompletely);
     assert!(
         elapsed < Duration::from_millis(600),
         "read timeout not enforced: {elapsed:?}"

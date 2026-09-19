@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader, IsTerminal, Write};
 
 use yolo_shell::daemon;
 use yolo_shell::fastpath::{self, FastPath};
+use yolo_shell::heuristics;
 use yolo_shell::jev_client::{self, Action, Context, Decision, Outcome, CONTEXT_ENV_VARS};
 
 const EXIT_ALLOW: i32 = 0;
@@ -23,6 +24,7 @@ yolo — evaluate a shell command before it runs
 
 USAGE:
     yolo [eval] [--no-prompt] <command>...
+    yolo explain [--json] [--branch <name>] <command>...
     yolo daemon [--idle-timeout <secs>]
 
 OPTIONS:
@@ -54,6 +56,7 @@ fn main() {
             exit_with(EXIT_ALLOW);
         }
         Some("daemon") => exit_with(run_daemon(&args[1..])),
+        Some("explain") => exit_with(run_explain(&args[1..])),
         _ => {}
     }
 
@@ -109,10 +112,99 @@ fn run(command: &str, no_prompt: bool) -> i32 {
 /// The daemon when one is listening, the in-process path otherwise. Both end
 /// at local heuristics if Jev cannot answer.
 fn decide(context: &Context) -> Outcome {
-    match daemon::decide(context, jev_client::deadline()) {
+    let outcome = match daemon::decide(context, jev_client::deadline()) {
         Some(outcome) => outcome,
         None => jev_client::evaluate(context),
+    };
+
+    heuristics::apply_severe_floor(outcome, context)
+}
+
+/// Evaluate and report, without acting. Always exits 0: this is for seeing
+/// what the engines think, not for gating anything.
+fn run_explain(args: &[String]) -> i32 {
+    let mut json = false;
+    let mut branch = None;
+    let mut rest = args;
+
+    loop {
+        match rest.first().map(String::as_str) {
+            Some("--json") => {
+                json = true;
+                rest = &rest[1..];
+            }
+            Some("--branch") => {
+                branch = rest.get(1).cloned();
+                rest = rest.get(2..).unwrap_or(&[]);
+            }
+            _ => break,
+        }
     }
+
+    let command = rest.join(" ");
+    if command.trim().is_empty() {
+        eprintln!("usage: yolo explain [--json] [--branch <name>] <command>...");
+        return EXIT_ALLOW;
+    }
+
+    let fast_path = fastpath::classify(&command) == FastPath::Allow;
+
+    let (outcome, mut context) = if fast_path {
+        (None, gather_context(&command))
+    } else {
+        let mut context = gather_context(&command);
+        if let Some(branch) = branch.clone() {
+            context.git_branch = Some(branch);
+        }
+        let outcome = decide(&context);
+        (Some(outcome), context)
+    };
+    if let Some(branch) = branch {
+        context.git_branch = Some(branch);
+    }
+
+    let (source, elapsed_ms, decision, note) = match &outcome {
+        Some(outcome) => (
+            outcome.source.to_string(),
+            outcome.elapsed.as_millis(),
+            outcome.decision.clone(),
+            outcome.note.clone(),
+        ),
+        None => (
+            "fast-path".to_string(),
+            0,
+            Decision::fail_open(),
+            Some("allowlisted".to_string()),
+        ),
+    };
+
+    let mut out = std::io::stdout();
+    if json {
+        let report = serde_json::json!({
+            "command": command,
+            "git_branch": context.git_branch,
+            "source": source,
+            "elapsed_ms": elapsed_ms,
+            "is_destructive": decision.is_destructive,
+            "risk_score": decision.risk_score,
+            "action": decision.action,
+            "reason": decision.reason,
+            "note": note,
+        });
+        let _ = writeln!(out, "{report}");
+    } else {
+        let _ = writeln!(
+            out,
+            "{command}\n  source      {source} ({elapsed_ms}ms)\n  risk        {}/10\n  \
+             destructive {}\n  action      {:?}\n  reason      {}",
+            decision.risk_score,
+            decision.is_destructive,
+            decision.action,
+            decision.reason.as_deref().unwrap_or("-"),
+        );
+    }
+
+    EXIT_ALLOW
 }
 
 fn run_daemon(args: &[String]) -> i32 {
@@ -136,7 +228,11 @@ fn bypass_reason(command: &str) -> Option<&'static str> {
     if std::env::var_os("YOLO_BYPASS").is_some_and(|v| !v.is_empty() && v != "0") {
         return Some("YOLO_BYPASS");
     }
-    if command == "yolo" || command.starts_with("yolo ") {
+    // Match the basename so `./target/release/yolo explain "rm -rf /"` and
+    // `/usr/local/bin/yolo ...` bypass too. No `yolo` subcommand executes the
+    // command it is given, so every invocation is safe to wave through.
+    let program = command.split_ascii_whitespace().next().unwrap_or("");
+    if program.rsplit('/').next() == Some("yolo") {
         return Some("yolo prefix");
     }
     None

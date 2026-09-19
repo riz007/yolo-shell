@@ -201,6 +201,15 @@ fn quoted_separators_never_smuggle_a_command_through() {
     assert_evaluated("echo 'x' ; rm -rf /");
 }
 
+/// Every `yolo` invocation is a bypass, including one run by path - no
+/// subcommand executes what it is given, and `yolo explain "rm -rf /"` must
+/// not be blocked by its own subject.
+#[test]
+fn yolo_invocations_are_not_evaluated_as_their_argument() {
+    // The fast path does not allowlist these; main.rs bypasses them first.
+    assert_evaluated("./target/release/yolo explain \"rm -rf /\"");
+}
+
 #[test]
 fn unknown_commands_escalate_by_default() {
     assert_evaluated("cargo build");

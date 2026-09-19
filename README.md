@@ -321,10 +321,24 @@ the one it was trying to prevent.
 ## 🛠️ Development
 
 ```bash
-cargo test                    # 59 tests
+cargo test                    # 76 tests
 cargo bench                   # asserts against the latency budget
 cargo clippy -- -D warnings
 cargo fmt -- --check
+```
+
+See what the engines think about a command without running it:
+
+```bash
+yolo explain "git push --force origin main"
+yolo explain --json --branch main "rm -rf /"
+```
+
+And check the risk rubric against a corpus spanning every band:
+
+```bash
+source ~/.config/yolo-shell/env
+./scripts/verify-rubric.py
 ```
 
 ```

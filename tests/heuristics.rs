@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use yolo_shell::heuristics::{engine_ready, evaluate};
-use yolo_shell::jev_client::{Action, Context};
+use yolo_shell::heuristics::{apply_severe_floor, engine_ready, evaluate, DATA_ARG_COMMANDS};
+use yolo_shell::jev_client::{Action, Context, Decision, Outcome, Source};
 
 fn ctx(command: &str) -> Context {
     Context {
@@ -280,4 +280,175 @@ fn redacted_commands_are_still_scored_correctly() {
         &ctx("psql postgres://admin:[REDACTED]@prod-db.internal/billing -c 'DROP TABLE users'"),
         Action::BlockCompletely,
     );
+}
+
+fn jev_said(risk: u8, action: Action) -> Outcome {
+    Outcome {
+        decision: Decision {
+            is_destructive: risk >= 4,
+            risk_score: risk,
+            action,
+            reason: Some("from jev".to_string()),
+        },
+        source: Source::Jev,
+        elapsed: std::time::Duration::from_millis(400),
+        note: None,
+    }
+}
+
+/// Observed live: Jev scored `git push --force origin main` at 7, which is a
+/// y/N prompt, where the spec and the local rules both call for a block.
+#[test]
+fn jev_cannot_downgrade_a_severe_local_rule() {
+    let context = ctx("git push origin main --force");
+    let floored = apply_severe_floor(jev_said(7, Action::WarnAndConfirm), &context);
+
+    assert_eq!(floored.decision.action, Action::BlockCompletely);
+    assert_eq!(
+        floored.decision.risk_score, 9,
+        "local rule score should win"
+    );
+    assert!(floored.decision.is_destructive);
+    assert!(
+        floored.note.is_some_and(|n| n.contains("raised 7 to 9")),
+        "the override should be visible in the trace"
+    );
+}
+
+/// Below the severe band Jev keeps full authority. This is where it beats the
+/// rule table: `./build` is restored by a rebuild, so 3 is the better answer.
+#[test]
+fn jev_may_still_relax_a_moderate_local_rule() {
+    let context = ctx("rm -rf ./build");
+    assert_eq!(
+        evaluate(&context).risk_score,
+        5,
+        "local scores this moderate"
+    );
+
+    let floored = apply_severe_floor(jev_said(3, Action::AllowImmediately), &context);
+    assert_eq!(
+        floored.decision.risk_score, 3,
+        "Jev should keep the lower score"
+    );
+    assert_eq!(floored.decision.action, Action::AllowImmediately);
+}
+
+#[test]
+fn the_floor_leaves_agreeing_decisions_alone() {
+    let context = ctx("rm -rf /");
+    let original = jev_said(10, Action::BlockCompletely);
+    let floored = apply_severe_floor(original, &context);
+
+    assert_eq!(floored.decision.risk_score, 10);
+    assert_eq!(floored.decision.reason.as_deref(), Some("from jev"));
+    assert!(floored.note.is_none(), "no override, so no note");
+}
+
+/// The floor is for Jev answers only; a local decision is already local.
+#[test]
+fn the_floor_does_not_touch_a_local_decision() {
+    let context = ctx("git push origin main --force");
+    let local = Outcome {
+        source: Source::Local,
+        ..jev_said(2, Action::AllowImmediately)
+    };
+
+    let floored = apply_severe_floor(local, &context);
+    assert_eq!(floored.decision.risk_score, 2, "left as-is");
+}
+
+/// A command that *mentions* something dangerous is not doing it. Blocking
+/// `grep -r "DROP TABLE" migrations/` is how a gatekeeper gets uninstalled.
+#[test]
+fn quoted_text_passed_to_a_text_tool_is_data_not_code() {
+    for command in [
+        r#"grep -r "DROP TABLE" migrations/"#,
+        r#"grep -rn "rm -rf" scripts/"#,
+        r#"echo "never run rm -rf /" | tee notes.txt"#,
+        r#"sed -i "s/rm -rf/echo/" deploy.sh"#,
+        r#"git commit -m "fix rm -rf bug in deploy script""#,
+        r#"git commit -m "stop calling kubectl delete namespace""#,
+        r#"printf "terraform destroy\n""#,
+        r#"awk '/DROP DATABASE/ {print}' audit.log"#,
+    ] {
+        assert_action(&ctx(command), Action::AllowImmediately);
+    }
+}
+
+/// The inverse must keep working: these programs really do run what they are
+/// handed, so their quotes stay code.
+#[test]
+fn quoted_code_passed_to_an_interpreter_is_still_scored() {
+    for command in [
+        "psql -c 'DROP DATABASE billing'",
+        "mysql -e 'TRUNCATE TABLE orders'",
+        "zsh -c 'rm -rf /'",
+        "bash -c \"rm -rf /\"",
+        "sh -c 'rm -rf /*'",
+    ] {
+        assert_action(&ctx(command), Action::BlockCompletely);
+    }
+}
+
+#[test]
+fn an_unterminated_quote_is_left_scorable() {
+    // Nothing is swallowed, so the command still scores on what it does.
+    let decision = evaluate(&ctx("echo \"rm -rf / ; kubectl delete namespace prod"));
+    assert!(
+        decision.risk_score >= 4,
+        "an unclosed quote hid the command"
+    );
+}
+
+#[test]
+fn the_data_command_table_is_sorted() {
+    let mut sorted = DATA_ARG_COMMANDS.to_vec();
+    sorted.sort_unstable();
+    assert_eq!(DATA_ARG_COMMANDS, sorted.as_slice());
+
+    // And every entry is reachable through the lookup.
+    for program in DATA_ARG_COMMANDS {
+        let command = format!(r#"{program} "rm -rf /" somefile"#);
+        assert_eq!(
+            evaluate(&ctx(&command)).action,
+            Action::AllowImmediately,
+            "lookup missed: {program}"
+        );
+    }
+}
+
+/// Jev scored `rails db:drop` at 8 with a production marker while the rule
+/// table said 1, so offline the database went without a prompt.
+#[test]
+fn orm_database_destruction_is_caught_offline() {
+    for command in [
+        "rails db:drop",
+        "rails db:reset",
+        "rake db:purge",
+        "bundle exec rails db:reset",
+        "prisma migrate reset",
+        "sequelize db:drop",
+        "alembic downgrade base",
+        "python manage.py flush",
+    ] {
+        assert_action(&ctx(command), Action::WarnAndConfirm);
+    }
+
+    assert_action(
+        &with_env("rails db:drop", "NODE_ENV", "production"),
+        Action::BlockCompletely,
+    );
+}
+
+#[test]
+fn ordinary_orm_commands_are_untouched() {
+    for command in [
+        "rails db:migrate",
+        "rails server",
+        "rake test",
+        "prisma generate",
+    ] {
+        assert_action(&ctx(command), Action::AllowImmediately);
+    }
 }

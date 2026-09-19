@@ -5,14 +5,16 @@
 //! rule sets a base score, context escalates it, highest match wins. This is
 //! allowed to block — the escape hatch is `yolo `, not a permissive default.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use regex::RegexSet;
 
-use crate::jev_client::{band_action, Context, Decision};
+use crate::jev_client::{band_action, Context, Decision, Outcome, Source};
 
 const MODERATE: u8 = 4;
+const SEVERE: u8 = 8;
 
 struct Rule {
     pattern: &'static str,
@@ -105,6 +107,23 @@ static RULES: &[Rule] = &[
     ),
     // ---- Moderate: recoverable, but worth a look. ----
     rule(r"(?i)\bdelete\s+from\b", 7, "deletes rows"),
+    // Jev scored `rails db:drop` at 8 in production where the rule table said
+    // 1, so offline the database was dropped without a prompt.
+    //
+    // `(?x)` because a raw string has no line continuation: a trailing `\`
+    // becomes part of the pattern, and the rule compiles but never matches.
+    rule(
+        r"(?ix)
+          \b(?:
+              (?: rails | rake | bundle \s+ exec \s+ rails ) \s+ db:(?: drop | reset | purge )
+            | prisma \s+ migrate \s+ reset
+            | sequelize \s+ db:drop
+            | alembic \s+ downgrade \s+ base
+            | manage\.py \s+ flush
+          )\b",
+        7,
+        "drops or resets the application database",
+    ),
     branch_rule(
         r"(?i)\bgit\s+push\b[^|;&]*\s(?:--force|-f)(?:\s|$)",
         6,
@@ -208,6 +227,89 @@ static RULES: &[Rule] = &[
     rule(r"(?i)\brm\s", 3, "deletes files"),
 ];
 
+/// Programs whose quoted arguments are text to search, print or record -
+/// never code to run. Without this, `grep -r "DROP TABLE" migrations/` reads
+/// as a database drop and gets blocked.
+///
+/// Deliberately an allowlist, and kept sorted. An unrecognised program keeps
+/// its quotes, so a missing entry costs a false positive, never a miss -
+/// which is why `psql -c`, `mysql -e` and `sh -c` are absent: those really do
+/// execute what they are handed.
+pub const DATA_ARG_COMMANDS: &[&str] = &[
+    "ack", "awk", "column", "comm", "cut", "echo", "fgrep", "fold", "grep", "jq", "printf", "rev",
+    "rg", "sed", "sort", "strings", "tee", "tr", "uniq",
+];
+
+/// Blank the contents of quoted arguments that are plainly data, so the rule
+/// table scores what a command *does*, not what it mentions.
+fn scorable(command: &str) -> Cow<'_, str> {
+    if !command.contains('"') && !command.contains('\'') {
+        return Cow::Borrowed(command);
+    }
+
+    let mut out = String::with_capacity(command.len());
+    let mut start = 0;
+
+    for (i, &byte) in command.as_bytes().iter().enumerate() {
+        if matches!(byte, b';' | b'|' | b'&' | b'\n') {
+            push_segment(&command[start..i], &mut out);
+            out.push(byte as char);
+            start = i + 1;
+        }
+    }
+    push_segment(&command[start..], &mut out);
+
+    Cow::Owned(out)
+}
+
+fn push_segment(segment: &str, out: &mut String) {
+    if takes_data_arguments(segment) {
+        blank_quoted(segment, out);
+    } else {
+        out.push_str(segment);
+    }
+}
+
+fn takes_data_arguments(segment: &str) -> bool {
+    let mut tokens = segment.split_ascii_whitespace();
+    let Some(program) = tokens.next() else {
+        return false;
+    };
+    let program = program.rsplit('/').next().unwrap_or(program);
+
+    if DATA_ARG_COMMANDS.binary_search(&program).is_ok() {
+        return true;
+    }
+
+    // `git commit -m "remove rm -rf from deploy"` records a message. git's
+    // destructive subcommands take no quoted code.
+    program == "git" && matches!(tokens.next(), Some("commit" | "tag" | "notes"))
+}
+
+/// Leaves an unterminated quote alone, which keeps the command scorable as
+/// written rather than silently swallowing the rest of the line.
+fn blank_quoted(segment: &str, out: &mut String) {
+    let mut rest = segment;
+
+    while let Some(open) = rest.find(['"', '\'']) {
+        let quote = rest.as_bytes()[open] as char;
+        out.push_str(&rest[..=open]);
+
+        match rest[open + 1..].find(quote) {
+            Some(close) => {
+                out.push(quote);
+                rest = &rest[open + 1 + close + 1..];
+            }
+            None => {
+                out.push_str(&rest[open + 1..]);
+                return;
+            }
+        }
+    }
+
+    out.push_str(rest);
+}
+
 fn is_protected_branch(name: &str) -> bool {
     matches!(name, "main" | "master" | "prod" | "production" | "release")
         || name.starts_with("release/")
@@ -248,8 +350,9 @@ pub fn evaluate(context: &Context) -> Decision {
         return Decision::fail_open();
     };
 
+    let command = scorable(&context.command);
     let matched = set
-        .matches(&context.command)
+        .matches(&command)
         .into_iter()
         .filter_map(|index| RULES.get(index))
         .max_by_key(|rule| rule.score);
@@ -267,7 +370,7 @@ pub fn evaluate(context: &Context) -> Decision {
             .as_deref()
             .is_some_and(is_protected_branch);
 
-        if on_protected || command_names_protected_branch(&context.command) {
+        if on_protected || command_names_protected_branch(&command) {
             score = score.saturating_add(3);
             reasons.push("on a protected branch".to_string());
         }
@@ -289,5 +392,43 @@ pub fn evaluate(context: &Context) -> Decision {
         risk_score: score,
         action: band_action(score),
         reason: Some(reasons.join("; ")),
+    }
+}
+
+/// Hold a Jev decision to the local engine's severe rules.
+///
+/// The local rules are deterministic and encode the spec's own examples, so a
+/// model must not talk us out of one. Jev stays free to relax anything below
+/// the severe band - that is where its judgement earns its keep, as with
+/// `rm -rf ./build`, which a rebuild restores.
+///
+/// Observed live: `git push --force origin main` scored 7 from Jev and 9
+/// locally, so the block the spec calls for became a y/N prompt.
+pub fn apply_severe_floor(outcome: Outcome, context: &Context) -> Outcome {
+    if outcome.source != Source::Jev || outcome.decision.risk_score >= SEVERE {
+        return outcome;
+    }
+
+    let local = evaluate(context);
+    if local.risk_score < SEVERE || local.risk_score <= outcome.decision.risk_score {
+        return outcome;
+    }
+
+    let jev_score = outcome.decision.risk_score;
+    Outcome {
+        decision: Decision {
+            is_destructive: true,
+            risk_score: local.risk_score,
+            action: outcome.decision.action.max(band_action(local.risk_score)),
+            reason: local.reason,
+        },
+        note: Some(match outcome.note {
+            Some(note) => format!(
+                "{note}; local rule raised {jev_score} to {}",
+                local.risk_score
+            ),
+            None => format!("local rule raised {jev_score} to {}", local.risk_score),
+        }),
+        ..outcome
     }
 }

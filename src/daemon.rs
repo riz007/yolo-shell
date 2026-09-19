@@ -102,8 +102,12 @@ fn owned_by_current_user(path: &std::path::Path) -> bool {
     }
 }
 
-/// Ask the daemon. `None` means there isn't a usable one, so the caller
-/// should take the in-process path.
+/// Ask the daemon.
+///
+/// `None` means no daemon is listening, so the caller should take the
+/// in-process path. Once the socket accepts, every failure is answered from
+/// local heuristics instead: falling through would spend the deadline a
+/// second time on the network, and a sick daemon would cost double.
 pub fn decide(context: &Context, deadline: Duration) -> Option<Outcome> {
     let started = Instant::now();
     let path = socket_path();
@@ -113,33 +117,51 @@ pub fn decide(context: &Context, deadline: Duration) -> Option<Outcome> {
     }
 
     let stream = UnixStream::connect(&path).ok()?;
-    stream.set_read_timeout(Some(deadline)).ok()?;
-    stream.set_write_timeout(Some(deadline)).ok()?;
 
-    let mut line = serde_json::to_string(&Request::from_context(context)).ok()?;
-    line.push('\n');
-
-    let mut writer = &stream;
-    writer.write_all(line.as_bytes()).ok()?;
-    writer.flush().ok()?;
-
-    let mut answer = String::new();
-    BufReader::new(&stream).read_line(&mut answer).ok()?;
-
-    match serde_json::from_str::<Response>(&answer).ok()? {
-        Response::Decided { decision, .. } => Some(Outcome {
+    Some(match exchange(&stream, context, deadline) {
+        Ok(Response::Decided { decision, .. }) => Outcome {
             decision,
             source: Source::Jev,
             elapsed: started.elapsed(),
             note: Some("via daemon".to_string()),
-        }),
-        Response::Unavailable { error } => Some(Outcome {
-            decision: heuristics::evaluate(context),
-            source: Source::Local,
-            elapsed: started.elapsed(),
-            note: Some(format!("daemon: {error}")),
-        }),
+        },
+        Ok(Response::Unavailable { error }) => {
+            locally(context, started, format!("daemon: {error}"))
+        }
+        Err(error) => locally(context, started, format!("daemon: {error}")),
+    })
+}
+
+fn locally(context: &Context, started: Instant, note: String) -> Outcome {
+    Outcome {
+        decision: heuristics::evaluate(context),
+        source: Source::Local,
+        elapsed: started.elapsed(),
+        note: Some(note),
     }
+}
+
+fn exchange(
+    stream: &UnixStream,
+    context: &Context,
+    deadline: Duration,
+) -> std::io::Result<Response> {
+    stream.set_read_timeout(Some(deadline))?;
+    stream.set_write_timeout(Some(deadline))?;
+
+    let mut line = serde_json::to_string(&Request::from_context(context))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    line.push('\n');
+
+    let mut writer = stream;
+    writer.write_all(line.as_bytes())?;
+    writer.flush()?;
+
+    let mut answer = String::new();
+    BufReader::new(stream).read_line(&mut answer)?;
+
+    serde_json::from_str(&answer)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// Run the daemon until idle. Blocks.

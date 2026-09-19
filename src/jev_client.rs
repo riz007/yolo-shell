@@ -235,8 +235,10 @@ const RISK_RUBRIC: &[&str] = &[
     "Deletes or overwrites local work that is not backed up elsewhere.",
     "Changes the local environment's tools, dependencies, or configuration.",
     "Discards uncommitted work, or rewrites history nobody else has pulled.",
-    "Changes shared non-production systems, or publishes something that cannot be withdrawn.",
-    "Changes production systems or data in a way that could be rolled back with effort.",
+    "Changes shared non-production systems, publishes something that cannot be withdrawn, \
+     or force-pushes a personal or feature branch.",
+    "Changes production systems or data in a way that could be rolled back with effort, \
+     or rewrites history on a protected branch such as main, master, or a release branch.",
     "Destroys production data, infrastructure, or history. Recovery depends on backups.",
     "Irreversible destruction at scale: a filesystem, a device, or a production datastore with no recovery path.",
 ];
@@ -349,7 +351,21 @@ pub enum JevError {
     NotConfigured,
     Timeout(u64),
     Transport(String),
+    /// A well-formed HTTP response the API refused. Carries its body, which
+    /// is where the API says what was actually wrong.
+    Rejected {
+        status: u16,
+        detail: String,
+    },
     Malformed(String),
+}
+
+/// A bounded, single-line excerpt of a server-supplied body, safe to print.
+fn excerpt(body: &str) -> String {
+    body.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_REASON_CHARS)
+        .collect()
 }
 
 impl fmt::Display for JevError {
@@ -358,6 +374,7 @@ impl fmt::Display for JevError {
             Self::NotConfigured => f.write_str("JEV_API_KEY not set"),
             Self::Timeout(ms) => write!(f, "no response within {ms}ms"),
             Self::Transport(detail) => write!(f, "transport: {detail}"),
+            Self::Rejected { status, detail } => write!(f, "http {status}: {detail}"),
             Self::Malformed(detail) => write!(f, "malformed response: {detail}"),
         }
     }
@@ -386,6 +403,10 @@ impl JevClient {
 
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_millis(MAX_TIMEOUT_MS)))
+            // Keep 4xx/5xx as ordinary responses so the body can be read. On
+            // the default, a 422 becomes `http status: 422` and the detail
+            // naming the offending field is thrown away.
+            .http_status_as_error(false)
             .build()
             .into();
 
@@ -408,14 +429,24 @@ impl JevClient {
             .call()
             .map_err(|e| JevError::Transport(e.to_string()))?;
 
+        let status = response.status().as_u16();
+
         // The body must be drained or the connection is dropped instead of
         // returned to the pool, and the first real command pays the
         // handshake anyway - which is the whole point of warming.
-        response
+        let body = response
             .body_mut()
-            .read_to_vec()
-            .map(|_| ())
-            .map_err(|e| JevError::Transport(e.to_string()))
+            .read_to_string()
+            .map_err(|e| JevError::Transport(e.to_string()))?;
+
+        if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            Err(JevError::Rejected {
+                status,
+                detail: excerpt(&body),
+            })
+        }
     }
 
     pub fn decide(&self, context: &Context) -> Result<Decision, JevError> {
@@ -435,10 +466,21 @@ impl JevClient {
             .send(&body)
             .map_err(|e| JevError::Transport(e.to_string()))?;
 
-        response
+        let status = response.status().as_u16();
+        let text = response
             .body_mut()
-            .read_json::<SystemOneResponse>()
-            .map_err(|e| JevError::Malformed(e.to_string()))?
+            .read_to_string()
+            .map_err(|e| JevError::Transport(e.to_string()))?;
+
+        if !(200..300).contains(&status) {
+            return Err(JevError::Rejected {
+                status,
+                detail: excerpt(&text),
+            });
+        }
+
+        serde_json::from_str::<SystemOneResponse>(&text)
+            .map_err(|e| JevError::Malformed(format!("{e}: {}", excerpt(&text))))?
             .into_decision()
     }
 }

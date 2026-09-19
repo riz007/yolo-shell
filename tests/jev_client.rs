@@ -496,3 +496,85 @@ fn the_rubric_legend_reads_as_a_reason_for_any_command() {
         }
     }
 }
+
+/// A rejected request must carry the API's own explanation. Without it the
+/// note reads `http status: 422` and says nothing about which field is wrong.
+#[test]
+fn an_api_rejection_carries_the_servers_explanation() {
+    let path = "/v1/systemone";
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut reader = BufReader::new(&stream);
+        let (mut length, mut line) = (0usize, String::new());
+        while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = v.trim().parse().unwrap_or(0);
+            }
+            if line.trim().is_empty() {
+                break;
+            }
+            line.clear();
+        }
+        let mut body = vec![0u8; length];
+        let _ = reader.read_exact(&mut body);
+
+        let detail = r#"{"detail":[{"loc":["body","questions","risk_score","criteria"],"msg":"Field required"}]}"#;
+        let mut stream = &stream;
+        let _ = write!(
+            stream,
+            "HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            detail.len(),
+            detail
+        );
+        let _ = stream.flush();
+    });
+
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let outcome = with_jev(&url, "test-key", || evaluate(&ctx("terraform destroy")));
+
+    assert_eq!(outcome.source, Source::Local);
+    let note = outcome.note.unwrap_or_default();
+    assert!(note.contains("422"), "status missing: {note}");
+    assert!(
+        note.contains("risk_score"),
+        "server detail was dropped: {note}"
+    );
+}
+
+/// The rubric must give force-push its own rung per branch class. Widening
+/// the severe level to catch `main` once pulled feature branches up with it.
+#[test]
+fn the_rubric_separates_force_push_by_branch_class() {
+    let (url, requests) = capture_once(ALLOW_TRIVIAL);
+    let _ = with_jev(&url, "test-key", || evaluate(&ctx("git push --force")));
+
+    let sent: serde_json::Value = serde_json::from_str(
+        &requests
+            .recv_timeout(Duration::from_secs(2))
+            .expect("no request"),
+    )
+    .expect("bad json");
+    let rubric: Vec<String> = sent["questions"]["risk_score"]["criteria"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_lowercase())
+        .collect();
+
+    let moderate = rubric[6].as_str();
+    let severe = rubric[7].as_str();
+
+    assert!(
+        moderate.contains("feature branch") || moderate.contains("personal"),
+        "no rung for force-pushing a personal branch: {moderate:?}"
+    );
+    assert!(
+        severe.contains("protected") || severe.contains("main"),
+        "the severe rung must name protected branches: {severe:?}"
+    );
+}
