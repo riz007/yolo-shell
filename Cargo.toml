@@ -1,0 +1,43 @@
+[package]
+name = "yolo-shell"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Low-latency CLI gatekeeper that intercepts destructive shell commands before they run."
+license = "MIT"
+repository = "https://github.com/riz007/yolo-shell"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "yolo_shell"
+path = "src/lib.rs"
+
+[[bin]]
+name = "yolo"
+path = "src/main.rs"
+
+[dependencies]
+# Default features off: the Unicode tables we do not use are most of the crate.
+regex = { version = "1", default-features = false, features = [
+    "std",
+    "perf",
+    "unicode-case",
+    "unicode-perl",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3.2.1", default-features = false, features = ["json", "rustls"] }
+
+[[bench]]
+name = "latency"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# A panic must never be catchable into a "block"; hooks fail open on any
+# exit code they do not recognise.
+panic = "abort"
+strip = true
