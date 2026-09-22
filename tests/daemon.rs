@@ -17,11 +17,16 @@ fn ctx(command: &str) -> Context {
     }
 }
 
-/// `YOLO_SOCKET` is process-wide and cargo runs these tests as threads in one
-/// process, so they take turns.
+/// `YOLO_SOCKET` and `JEV_API_KEY` are process-wide and cargo runs these
+/// tests as threads in one process, so they take turns.
+///
+/// Taking the guard also gives the process a key: `decide` consults the
+/// daemon only for a caller that could have called Jev itself.
 fn env_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::set_var("JEV_API_KEY", "test-key");
+    guard
 }
 
 /// Unix socket paths are capped near 104 bytes, so tests stay in /tmp rather
@@ -160,6 +165,37 @@ fn a_silent_daemon_is_answered_locally_within_the_deadline() {
     assert!(
         elapsed < Duration::from_millis(600),
         "read timeout not enforced: {elapsed:?}"
+    );
+    // A bare `WouldBlock` prints as "Resource temporarily unavailable
+    // (os error 35)", which names neither the cause nor the fix.
+    assert_eq!(
+        outcome.note.as_deref(),
+        Some("daemon: no response within 200ms"),
+        "a stalled daemon should report the deadline, not an errno"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The daemon holds a key of its own, so without this gate an unset
+/// `JEV_API_KEY` still reached Jev. That is how `verify-rubric.py` — which
+/// drops the key to produce its "local" column — was silently comparing Jev
+/// against Jev whenever a daemon happened to be running.
+#[test]
+fn an_unconfigured_caller_does_not_consult_the_daemon() {
+    let _guard = env_guard();
+    let path = socket("unconfigured");
+    let _listener = UnixListener::bind(&path).expect("bind");
+
+    std::env::set_var("YOLO_SOCKET", &path);
+    std::env::remove_var("JEV_API_KEY");
+    let outcome = daemon::decide(&ctx("rm -rf /"), Duration::from_millis(200));
+    std::env::remove_var("YOLO_SOCKET");
+
+    assert!(
+        outcome.is_none(),
+        "a caller with no key must take the in-process path, not borrow the \
+         daemon's key"
     );
 
     let _ = std::fs::remove_file(&path);

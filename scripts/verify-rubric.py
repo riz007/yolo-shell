@@ -98,6 +98,17 @@ def main():
         jev = explain(command, branch, extra, use_jev=True)
         loc = explain(command, branch, extra, use_jev=False)
 
+        # A running daemon holds its own key, so dropping JEV_API_KEY from the
+        # environment was once not enough to isolate the local engine - the
+        # "local" column silently became a second Jev column and every row
+        # agreed. Refuse to print a comparison that isn't one.
+        if loc["source"] not in ("local", "fast-path"):
+            sys.exit(
+                f"the local column is not local ({loc['source']}, {loc['note']}).\n"
+                "A daemon is answering for an unconfigured caller. Re-run with "
+                "YOLO_NO_DAEMON=1, or rebuild: this is fixed in current builds."
+            )
+
         answered = jev["source"] == "jev"
         if not answered:
             fallbacks.append((command, jev["note"]))
