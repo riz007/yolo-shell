@@ -70,7 +70,8 @@ YOLO-Shell splits the problem in two, the way you do.
 **System 1 — reflex.** A local fast-path filter recognises commands that only
 read or navigate (`ls`, `cd`, `cat`, `git status`) and lets them through with
 no network call at all. This is a sorted-table lookup over the command's
-tokens: **178ns** in-process, ~2ms including process spawn. It is the path the
+tokens: **under 200ns** in-process (85–175ns across runs), ~2ms including
+process spawn. It is the path the
 overwhelming majority of your commands take.
 
 **System 2 — judgement.** Anything else goes to **TypeSafe Jev**, a typed
@@ -93,16 +94,18 @@ answers instead. You are never waiting on a network you cannot reach.
 ### The connection daemon
 
 The hook spawns a fresh `yolo` per command, so the naive path repeats DNS, TCP
-and TLS every single time. Against us-west-2 that measured **~455ms of
-handshake to wrap ~350ms of actual inference** — most of your wait was setup,
-paid again and again.
+and TLS every single time. Against us-west-2 that setup measured **~590ms on
+top of a ~358ms round trip** — most of your wait was handshake, paid again and
+again.
 
-`yolo daemon` holds one warm connection and answers over a unix socket:
+`yolo daemon` holds one warm connection and answers over a unix socket.
+Measured from a machine ~220ms from the endpoint, `kubectl delete namespace
+billing`, medians of 10 and 12 runs:
 
-| | per command |
+| | per command (median) |
 |---|---|
-| without daemon | ~850ms |
-| with daemon | ~400ms |
+| without daemon | ~950ms |
+| with daemon | ~358ms |
 
 The shell hooks start it for you when `JEV_API_KEY` is set. It exits when
 idle, a second instance exits immediately, and the socket is `0600` because
@@ -115,10 +118,20 @@ yolo daemon --idle-timeout 3600   # run it yourself
 YOLO_NO_DAEMON=1                  # opt out
 ```
 
-> [!NOTE]
-> Even warm, a round trip is one RTT plus inference. From a machine ~220ms
-> from the endpoint that is ~400ms, which is over the 250ms the spec budgets.
-> The remaining fix is a closer region, not more local engineering.
+> [!IMPORTANT]
+> Even warm, a round trip is one RTT plus inference — ~358ms median from a
+> machine ~220ms away. That is over the 200ms default deadline, so **at the
+> default setting from this distance Jev never answers and every decision
+> comes from the local engine.** `YOLO_DEBUG=1` shows it:
+>
+> ```
+> yolo: local decided in 205ms (daemon: no response within 200ms)
+> ```
+>
+> To actually exercise Jev, raise the deadline (`JEV_TIMEOUT_MS=1000`) and
+> accept the pause, or run closer to the endpoint. The 200ms default is the
+> budget a gatekeeper *should* have, not one this path currently meets; the
+> remaining fix is a closer region, not more local engineering.
 
 ---
 
@@ -159,14 +172,14 @@ user and the statement did, because those are what the decision depends on.
 
 |                                   |                                                                                                                                                                   |
 | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ⚡ **Invisible on safe commands** | 178ns filter, ~2ms end-to-end. No network call, no token spend.                                                                                                   |
+| ⚡ **Invisible on safe commands** | Sub-200ns filter, ~2ms end-to-end. No network call, no token spend.                                                                                                   |
 | ⏱️ **Hard 200ms ceiling**         | Enforced by a wall-clock deadline in the client, not by the HTTP library's own timeout — a stalled DNS lookup cannot outlast it.                                  |
 | 🔑 **BYOK**                       | Bring your own TypeSafe Jev key. No account required to start; heuristics work with no key at all.                                                                |
 | 🧭 **Context-aware**              | Weighs working directory, Git branch, and `AWS_PROFILE` / `KUBE_CONTEXT` / `NODE_ENV`. `git push --force` is a warning on a feature branch and a block on `main`. |
 | 📴 **Works offline**              | 40-rule deterministic engine takes over on timeout, network failure, or missing key. `rm -rf /` is blocked on a plane.                                            |
 | 🔒 **Secrets scrubbed**           | Passwords, tokens, connection strings and `Authorization` headers are removed before transmission. The unredacted command is not a serialisable type.             |
-| 🐚 **Real shells**                | Zsh, Bash and Fish, each verified driving a live pty — not just syntax-checked.                                                                                   |
-| 📦 **One binary**                 | No Node, no Python, no runtime. 2.3MB, statically linked TLS.                                                                                                     |
+| 🐚 **Real shells**                | Native Zsh, Bash and Fish integrations, each syntax-checked in CI. The decision engine behind them is covered by the Rust suite; the hooks themselves are not yet driven by a pty in CI. |
+| 📦 **One binary**                 | No Node, no Python, no runtime. 2.4MB, statically linked TLS.                                                                                                     |
 
 ---
 
@@ -234,13 +247,23 @@ Then source it from your rc file, **before** the hook line:
 Confirm it is being used:
 
 ```bash
-YOLO_DEBUG=1 ~/.yolo-shell/target/release/yolo eval "kubectl delete namespace billing"
-# yolo: jev decided in 143ms: risk 9/10
+YOLO_DEBUG=1 JEV_TIMEOUT_MS=1000 ~/.yolo-shell/target/release/yolo eval "kubectl delete namespace billing"
+# yolo: jev decided in 412ms: risk 9/10
 ```
 
-`local decided in 200ms (no response within 200ms)` means the key or endpoint
-is wrong and you are running on heuristics — decisions are still made, just
-without Jev's context awareness.
+The raised deadline is deliberate — at the 200ms default this almost certainly
+reports `local` instead, which tells you nothing about whether your key works.
+
+Once you know Jev answers, these are the failures worth acting on:
+
+| Trace | Meaning |
+|---|---|
+| `no response within Nms` | The deadline, not the key. Raise `JEV_TIMEOUT_MS` before suspecting anything else. |
+| `http 401` / `http 403` | Key wrong, expired, or not being sent. |
+| `http 422` | Request shape rejected; the detail names the offending field. |
+| `JEV_API_KEY not set` | The key never reached this process — check it is sourced *before* the hook line. |
+
+Either way decisions are still made, just without Jev's context awareness.
 
 ---
 
@@ -255,7 +278,7 @@ drwxr-xr-x  12 dev  staff   384 Nov 14 09:22 .
 -rw-r--r--   1 dev  staff  1823 Nov 14 09:21 Cargo.toml
 ```
 
-_Fast-path hit. 178ns filter, ~2ms total. Jev never contacted._
+_Fast-path hit. Sub-200ns filter, ~2ms total. Jev never contacted._
 
 **Risky — intercepted with a risk score:**
 
@@ -321,7 +344,7 @@ the one it was trying to prevent.
 ## 🛠️ Development
 
 ```bash
-cargo test                    # 76 tests
+cargo test                    # 90 tests
 cargo bench                   # asserts against the latency budget
 cargo clippy -- -D warnings
 cargo fmt -- --check

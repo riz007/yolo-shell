@@ -1,9 +1,9 @@
 //! A resident process holding a warm connection to Jev.
 //!
 //! The hook spawns a fresh `yolo` per command, so the in-process path repeats
-//! DNS + TCP + TLS every time — measured at ~455ms against us-west-2, dwarfing
-//! Jev's own ~350ms of inference. The daemon pays that once and answers over a
-//! unix socket.
+//! DNS + TCP + TLS every time — measured at ~590ms against us-west-2, on top
+//! of a ~358ms warm round trip. The daemon pays the handshake once and answers
+//! over a unix socket.
 //!
 //! It is strictly an accelerator. If the socket is missing, stale, or slow,
 //! the CLI falls back to the in-process path and then to local heuristics, so
@@ -110,6 +110,16 @@ fn owned_by_current_user(path: &std::path::Path) -> bool {
 /// second time on the network, and a sick daemon would cost double.
 pub fn decide(context: &Context, deadline: Duration) -> Option<Outcome> {
     let started = Instant::now();
+
+    // The daemon holds its own key, so it answers for callers that have none.
+    // That makes an unset `JEV_API_KEY` mean "ask the daemon" instead of
+    // "heuristics only" — which silently turned the rubric harness's local
+    // column into a second Jev column. Consult it only when this process is
+    // configured to call Jev itself.
+    if !crate::jev_client::configured() {
+        return None;
+    }
+
     let path = socket_path();
 
     if !path.exists() || !owned_by_current_user(&path) {
@@ -128,8 +138,20 @@ pub fn decide(context: &Context, deadline: Duration) -> Option<Outcome> {
         Ok(Response::Unavailable { error }) => {
             locally(context, started, format!("daemon: {error}"))
         }
-        Err(error) => locally(context, started, format!("daemon: {error}")),
+        Err(error) => locally(context, started, daemon_note(&error, deadline)),
     })
+}
+
+/// A socket read that hits `SO_RCVTIMEO` surfaces as `WouldBlock`, which
+/// prints as "Resource temporarily unavailable (os error 35)" and tells the
+/// reader nothing. Name the deadline instead — it is the actionable part.
+fn daemon_note(error: &std::io::Error, deadline: Duration) -> String {
+    match error.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+            format!("daemon: no response within {}ms", deadline.as_millis())
+        }
+        _ => format!("daemon: {error}"),
+    }
 }
 
 fn locally(context: &Context, started: Instant, note: String) -> Outcome {

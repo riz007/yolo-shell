@@ -392,6 +392,14 @@ pub struct JevClient {
     model: String,
 }
 
+/// Whether this process has a key to call Jev with.
+///
+/// Separate from [`JevClient::from_env`] so a caller can ask the question
+/// without building an agent, and so the daemon path can be gated on it.
+pub fn configured() -> bool {
+    std::env::var("JEV_API_KEY").is_ok_and(|key| !key.is_empty())
+}
+
 impl JevClient {
     /// `Err(NotConfigured)` when there is no key, which is the normal
     /// heuristics-only setup rather than a failure.
